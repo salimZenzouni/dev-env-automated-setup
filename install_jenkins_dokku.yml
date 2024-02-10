@@ -1,0 +1,153 @@
+- name: Install Jenkins and Dokku on Ubuntu
+  hosts: dev_servers
+  become: yes
+  vars:
+    java_version: "openjdk-11-jdk"
+    jenkins_dependencies: [git, curl]
+    dokku_version: "0.33.3"
+    app_name: "ruby-getting-started"
+    app_domain: "mydomain.com" # replace with your domain name
+    lets_encrypt_mail: "sample@sample.com" # replace with your email
+  gather_facts: yes
+
+  tasks:
+    - name: Install Java for Jenkins
+      apt:
+        name: "{{ java_version }}"
+        update_cache: yes
+
+    - name: Install Jenkins dependencies
+      apt:
+        name: "{{ jenkins_dependencies }}"
+        update_cache: yes
+        state: present
+
+    - name: Add Jenkins repository key
+      ansible.builtin.apt_key:
+        url: "https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key"
+        state: present
+
+    - name: Add Jenkins repository
+      ansible.builtin.apt_repository:
+        repo: "deb https://pkg.jenkins.io/debian-stable binary/"
+        state: present
+        update_cache: yes
+
+    - name: Install Jenkins
+      apt:
+        name: jenkins
+        state: present
+        update_cache: yes
+
+    - name: Install Dokku prerequisites
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      loop:
+        - gnupg
+        - wget
+
+    - name: Install Dokku
+      apt:
+        name: "dokku={{ dokku_version }}"
+        state: present
+        update_cache: yes
+
+    - name: Setup Dokku 
+      ansible.builtin.shell: dokku plugin:install-dependencies --core
+
+    - name: Check if Dokku application exists
+      ansible.builtin.shell: dokku apps:list | grep -qw {{ app_name }}
+      register: app_check
+      failed_when: app_check.rc == 1 and "You haven't deployed any applications yet" not in app_check.stderr
+      changed_when: false
+
+    - name: Create Dokku application
+      ansible.builtin.shell: dokku apps:create {{ app_name }}
+      when: app_check.rc != 0
+
+    - name: Check if Dokku postgres plugin is installed
+      ansible.builtin.shell: dokku plugin:list
+      register: dokku_plugin_list
+      changed_when: false
+
+    - name: Install Dokku postgres plugin
+      ansible.builtin.shell: dokku plugin:install https://github.com/dokku/dokku-postgres.git postgres
+      when: "'postgres' not in dokku_plugin_list.stdout"
+
+    - name: Check if Dokku PostgreSQL database exists
+      ansible.builtin.shell: dokku postgres:list | grep -qw {{ app_name }}_db
+      register: postgres_db_check
+      failed_when: app_check.rc == 1 and "There are no Postgres services" not in app_check.stderr
+      changed_when: false
+
+    - name: Create a postgres database
+      ansible.builtin.shell: dokku postgres:create {{ app_name }}_db
+      when: postgres_db_check.rc != 0
+
+    - name: Check if the application is already linked to the database
+      ansible.builtin.shell: dokku postgres:linked {{ app_name }}_db {{ app_name }}
+      register: db_link_result
+      failed_when: app_check.rc == 1 and "is not linked" not in app_check.stderr
+      changed_when: false
+
+    - name: Link the database to the application if not already linked
+      ansible.builtin.shell: dokku postgres:link {{ app_name }}_db {{ app_name }}
+      when: "'is not linked to' in db_link_result.stderr" 
+
+    - name: Check if Let's Encrypt plugin is installed
+      ansible.builtin.shell: dokku plugin:list
+      register: letsencrypt_plugin_check
+      changed_when: false
+
+    - name: Install Let's Encrypt plugin
+      ansible.builtin.shell: dokku plugin:install https://github.com/dokku/dokku-letsencrypt.git
+      when: "'letsencrypt' not in letsencrypt_plugin_check.stdout"
+
+    - name: Enable staging env for letsecnryp    
+      ansible.builtin.shell: dokku config:set --global DOKKU_LETSENCRYPT_SERVER=staging
+
+    - name: Set global email for letsencrypt 
+      ansible.builtin.shell: dokku letsencrypt:set --global email {{ lets_encrypt_mail }}
+
+    - name: Set a custom domain that you own for your application    
+      ansible.builtin.shell: dokku domains:set {{ app_name }} {{ app_domain }}
+
+    - name: Enable Let's Encrypt for the application
+      ansible.builtin.shell: dokku letsencrypt:enable {{ app_name }}
+
+    - name: Ensure the target directory is absent
+      ansible.builtin.file:
+        path: "/tmp/{{ app_name }}"
+        state: absent
+      delegate_to: localhost
+
+    - name: Clone the repository
+      ansible.builtin.git:
+        repo: 'https://github.com/heroku/ruby-getting-started.git'
+        dest: "/tmp/{{ app_name }}"
+      delegate_to: localhost
+
+    - name: Set git remote for Dokku
+      ansible.builtin.shell: |
+        if git remote | grep -qw dokku; then
+          git remote remove dokku
+        fi
+        git remote add dokku dokku@{{ inventory_hostname }}:{{ app_name }}
+      args:
+        chdir: "/tmp/{{ app_name }}"
+      delegate_to: localhost
+
+    - name: Push to Dokku
+      ansible.builtin.shell: git push dokku main
+      args:
+        chdir: "/tmp/{{ app_name }}"
+      delegate_to: localhost
+      ignore_errors: yes
+
+  handlers:
+    - name: Restart Jenkins
+      systemd:
+        name: jenkins
+        state: restarted
